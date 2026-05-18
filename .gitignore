@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.whatsapp
+token.json
+sessions/
+data/
+logs/
+__pycache__/
+*.pyc
+backup/
+*.log
+*.err
+*.out
+server.err*
+server.out*
+config/credentials.json
