@@ -7,6 +7,7 @@ import { google } from "googleapis";
 import http from "http";
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pino from 'pino';
+import qrcode from 'qrcode-terminal';
 
 // 1. CONFIGURATION & ENV
 const envs = {};
@@ -63,13 +64,20 @@ function getSession(sender) {
 }
 
 // 2. HELPERS
+function localDateStr(date) {
+    const y = date.getFullYear();
+    const m = (date.getMonth() + 1).toString().padStart(2, "0");
+    const d = date.getDate().toString().padStart(2, "0");
+    return y + "-" + m + "-" + d;
+}
+
 function resolveDate(text) {
     const now = new Date();
     const t = text.toLowerCase();
-    if (t.includes("today")) return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    if (t.includes("tomorrow")) return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    if (t.includes("today")) return localDateStr(now);
+    if (t.includes("tomorrow")) return localDateStr(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
     const match = text.match(/\d{4}-\d{2}-\d{2}/);
-    if (match) return new Date(match[0]);
+    if (match) return match[0];
     return null;
 }
 
@@ -89,7 +97,7 @@ function extractTime(text) {
 }
 
 function stripThinking(text) {
-    return text.replace(/<think\s\S*?<\/think>/g, "").trim();
+    return text.replace(/<think[\s\S]*?<\/think>/g, "").trim();
 }
 
 // 3. GOOGLE CALENDAR CORE
@@ -125,10 +133,24 @@ async function createBooking(auth, eventData) {
 }
 
 // 3b. AVAILABILITY CHECKS
+function sanitizeTime(timeStr) {
+    // Extract HH:MM from formats like "9:07:31 PM", "14:30", "2:00 PM", etc.
+    const m = timeStr.match(/(\d{1,2}):(\d{2})/);
+    if (!m) return null;
+    let h = parseInt(m[1]), min = parseInt(m[2]);
+    if (/pm/i.test(timeStr) && h < 12) h += 12;
+    if (/am/i.test(timeStr) && h === 12) h = 0;
+    return (h < 10 ? "0" + h : h) + ":" + (min < 10 ? "0" + min : min);
+}
 async function checkAvailability(auth, dateStr, startTimeStr, durationMins) {
     const calendar = google.calendar({ version: "v3", auth });
     const tz = envs.TIMEZONE || "Asia/Kuala_Lumpur";
-    const start = new Date(dateStr + "T" + startTimeStr + ":00");
+    const time = sanitizeTime(startTimeStr);
+    if (!time) return { available: false, conflicts: [], error: "Invalid time format: " + startTimeStr };
+    // Validate date
+    const d = new Date(dateStr + "T" + time + ":00");
+    if (isNaN(d.getTime())) return { available: false, conflicts: [], error: "Invalid date: " + dateStr };
+    const start = d;
     const end = new Date(start.getTime() + durationMins * 60000);
     try {
         const res = await calendar.events.list({
@@ -158,7 +180,9 @@ async function checkAvailability(auth, dateStr, startTimeStr, durationMins) {
 async function findAvailableSlots(auth, dateStr, durationMins) {
     const calendar = google.calendar({ version: "v3", auth });
     const tz = envs.TIMEZONE || "Asia/Kuala_Lumpur";
-    const dayStart = new Date(dateStr + "T08:00:00");
+    const d = new Date(dateStr + "T08:00:00");
+    if (isNaN(d.getTime())) return [];
+    const dayStart = d;
     const dayEnd = new Date(dateStr + "T18:00:00");
     try {
         const res = await calendar.events.list({
@@ -341,19 +365,41 @@ async function callOllamaWithSkills(systemPrompt, userMessage, history, senderPh
         return "- " + name + params + ": " + skill.description;
     }).join("\n");
 
-    const fullPrompt = systemPrompt + "\n\nYou have access to the following skills:\n" + skillDescriptions + "\n\nWhen you need to use a skill, include the call in your response using this EXACT format:\n[SKILL:skill_name|param1=value1|param2=value2]\n\nYou can use multiple skills in one response. Examples:\n[SKILL:list_services]\n[SKILL:check_availability|date=2025-05-16|time=10:00|duration=60]\n[SKILL:find_available_slots|date=2025-05-16|duration=30]\n[SKILL:create_booking|date=2025-05-16|time=10:00|service_id=consultation|name=John|phone=123456]\n\nIMPORTANT RULES:\n- You MUST call check_availability or find_available_slots BEFORE every booking proposal. NEVER assume a slot is free.\n- If check_availability returns UNAVAILABLE or an ERROR, you MUST NOT confirm the booking. Offer alternatives instead.\n- ONLY use create_booking when the user has EXPLICITLY confirmed (said yes, confirm, book it, etc.) AND availability has been verified.\n- If a slot is NOT available, use find_available_slots to find alternatives and propose them.\n- When the user wants to change date/time/service while confirming, LET them change it - do NOT force the original booking.\n- When proposing times, use friendly 12-hour format (e.g., 2:30 PM).\n- Keep responses concise and conversational.\n- Do NOT mention skill calls or technical details to the user.\n- NEVER tell the user a booking is confirmed unless create_booking returned success: true.\n\nConversation History:\n" + history.join("\n") + "\n\nUser says: " + userMessage + "\n\nRespond naturally. If you need to check something or take an action, include the appropriate skill call(s) in your response.";
+    const todayStr = localDateStr(new Date());
+    const tomorrowStr = localDateStr(new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1));
+    // Extract user name from systemPrompt (format: "User: NAME")
+    const userName = (systemPrompt.match(/User:\s*(\S+)/) || [,""])[1];
+    const fullPrompt = systemPrompt + "\n\nAVAILABLE ACTIONS:\n" + skillDescriptions + "\n\n" +
+"Use [SKILL:name|param=value|...] in your response to call an action. Example:\n" +
+"  Check: [SKILL:check_availability|date=" + todayStr + "|time=10:00|duration=60]\n" +
+"  Book:  [SKILL:create_booking|date=" + todayStr + "|time=10:00|service_id=consultation|name=" + userName + "|phone=" + senderPhone + "]\n" +
+"  Slots: [SKILL:find_available_slots|date=" + tomorrowStr + "|duration=60]\n\n" +
+"RULES:\n" +
+"- FIRST message asking to book → output ONLY [SKILL:check_availability|...] (no other text)\n" +
+"- [SKILL:...] runs silently and is hidden from user\n" +
+"- When user says yes/confirm after check → output [SKILL:create_booking|...] with all params from context (do NOT check availability again)\n" +
+"- After create_booking, tell user the result\n" +
+"- Keep replies to 1-2 sentences\n\n" +
+"History:\n" + history.slice(-4).join("\n") + "\n\nUser: " + userMessage;
 
     let aiRes;
     try {
         aiRes = await callOllama(fullPrompt);
     } catch (e) {
+        console.error("[AI] Initial call failed:", e.message);
         return { response: "I am sorry, I am having trouble right now. Please try again.", bookingCreated: false };
     }
 
+    // Parse skill calls from RAW response (before stripping thinking tags)
+    console.log("[TRACE] Full prompt:\n" + fullPrompt.slice(0, 600));
+    console.log("[TRACE] Raw AI response:\n" + aiRes.slice(0, 600));
     const skillCalls = parseSkillCalls(aiRes);
+    console.log("[TRACE] skillCalls found:", skillCalls.length, JSON.stringify(skillCalls));
 
     if (skillCalls.length === 0) {
-        return { response: aiRes.replace(/\[SKILL:[^\]]+\]/g, "").trim(), bookingCreated: false };
+        const textResponse = stripThinking(aiRes).replace(/\[SKILL:[^\]]+\]/g, "").trim();
+        if (!textResponse) return { response: "Hello! How can I help you today?", bookingCreated: false };
+        return { response: textResponse, bookingCreated: false };
     }
 
     const skillResults = await executeSkills(skillCalls);
@@ -363,26 +409,61 @@ async function callOllamaWithSkills(systemPrompt, userMessage, history, senderPh
     }).join("\n");
 
     let bookingCreated = false;
+    let bookingLink = "";
+    let bookingDetails = null;
+    const hasCreateBooking = skillResults.some(r => r.skill === "create_booking");
     for (const r of skillResults) {
         if (r.skill === "create_booking" && r.result) {
             try {
                 const parsed = JSON.parse(r.result);
-                if (parsed.success) bookingCreated = true;
+                if (parsed.success) {
+                    bookingCreated = true;
+                    bookingLink = parsed.link || "";
+                    bookingDetails = parsed;
+                }
             } catch (err) { /* ignore */ }
         }
     }
 
-    const followUpPrompt = fullPrompt + "\n\nYou used these skills and got these results:\n" + resultsText + "\n\nBased on these results, provide a natural, conversational response to the user. Do NOT include any more skill calls. IMPORTANT: Only confirm a booking if create_booking returned success: true. If availability check returned UNAVAILABLE or ERROR, do NOT tell the user the slot is booked - instead offer alternatives. If a booking was NOT created, do NOT say it was confirmed.";
+    // If booking was successful, format response directly with the link
+    if (bookingCreated && bookingDetails) {
+        const date = bookingDetails.date || "?";
+        const time = bookingDetails.time || "?";
+        const summary = bookingDetails.summary || "Meeting";
+        const link = bookingLink ? "\n\nGoogle Calendar link: " + bookingLink : "";
+        const msg = "Your " + summary + " has been booked for " + date + " at " + time + "." + link;
+        return { response: msg, bookingCreated: true };
+    }
 
+    // Follow-up: tell the AI what happened and force a direct answer
+    const resultSummary = skillResults.map(function(r) {
+        return r.skill + (r.error ? " error: " + r.error : " result: " + r.result);
+    }).join("\n");
+    const followUpContext = hasCreateBooking
+        ? "create_booking returned: " + resultsText + "\nThe booking FAILED. Tell the user what went wrong."
+        : "You only checked availability — you did NOT call create_booking.\nResult:\n" + resultsText + "\nTell the user the result and ask if they want to proceed.";
+    let followUpPrompt = followUpContext + "\n\n" + systemPrompt + "\nUser: " + userMessage;
+
+    let finalRes;
     try {
-        const finalRes = await callOllama(followUpPrompt);
-        return { response: finalRes.replace(/\[SKILL:[^\]]+\]/g, "").trim(), bookingCreated };
+        finalRes = await callOllama(followUpPrompt);
+        let loopGuard = 0;
+        while (parseSkillCalls(finalRes).length > 0 && loopGuard < 2) {
+            followUpPrompt = followUpContext + "\n\nRespond naturally. No [SKILL:...].";
+            finalRes = await callOllama(followUpPrompt);
+            loopGuard++;
+        }
+        const cleanResponse = stripThinking(finalRes).replace(/\[SKILL:[^\]]+\]/g, "").trim();
+        return { response: cleanResponse || resultsText, bookingCreated: false };
     } catch (e) {
-        return { response: resultsText, bookingCreated };
+        console.error("[AI] Follow-up call failed:", e.message);
+        return { response: resultsText, bookingCreated: false };
     }
 }
 
 // 4. AI INTEGRATION
+const OLLAMA_TIMEOUT = 600000;
+
 async function callOllama(prompt) {
     const host = envs.OLLAMA_HOST || "http://localhost:11434";
     const model = "deepseek-r1:8b";
@@ -398,9 +479,15 @@ async function callOllama(prompt) {
             let data = "";
             res.on("data", (chunk) => data += chunk);
             res.on("end", () => {
-                try { const raw = JSON.parse(data).response; resolve(stripThinking(raw)); } catch (e) { reject(e); }
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.error) reject(new Error("Ollama: " + parsed.error));
+                    else if (typeof parsed.response !== "string") reject(new Error("Ollama: empty response"));
+                    else resolve(parsed.response);
+                } catch (e) { reject(e); }
             });
         });
+        req.setTimeout(OLLAMA_TIMEOUT, () => { req.destroy(); reject(new Error("Ollama request timed out after " + (OLLAMA_TIMEOUT / 1000) + "s")); });
         req.on("error", reject);
         req.write(JSON.stringify({ model, prompt, stream: false }));
         req.end();
@@ -409,100 +496,104 @@ async function callOllama(prompt) {
 
 // 5. MAIN INTEGRATED LOOP
 async function main() {
-    console.log("Starting Business Receptionist (VERIFIED CALENDAR MODE)...");
-    
     const SESSION_DIR = "sessions/baileys_auth";
+    const logger = pino({ level: 'silent' });
+    let sock;
+    let reconnectTimer;
+
     if (!fs_sync.existsSync(SESSION_DIR)) {
         fs_sync.mkdirSync(SESSION_DIR, { recursive: true });
     }
-
-    const logger = pino({ level: 'silent' });
     const { version } = await fetchLatestBaileysVersion();
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-    
-    const sock = makeWASocket({
-        version,
-        logger,
-        printQRInTerminal: true, 
-        auth: state,
-        syncFullHistory: false,
-        markOnlineOnConnect: true,
-        generateHighQualityLink: true,
-    });
 
-    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-        if (connection === 'open') {
-            console.log("? WhatsApp Connected!");
-        }
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`Connection closed. Reconnect: ${shouldReconnect}`);
-            if (shouldReconnect) setTimeout(main, 5000);
-            else process.exit(1);
-        }
-    });
+    async function connect() {
+        sock = makeWASocket({
+            version, logger, auth: state,
+            syncFullHistory: false, markOnlineOnConnect: true,
+        });
 
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-        for (const msg of messages) {
-            if (msg.key.fromMe) continue;
-            const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
-            if (!text) continue;
-
-            const sender = msg.key.remoteJid;
-            const pushName = msg.pushName || 'unknown';
-            console.log(`[MSG] ${pushName}: ${text}`);
-            
-            const session = getSession(sender);
-            const lowerText = text.toLowerCase();
-            
-            session.history.push(`User: ${text}`);
-
-
-            // Pre-extract structured info from message for AI context
-            const dDate = resolveDate(lowerText);
-            const dTime = extractTime(lowerText);
-            const dServ = SERVICES.find(s => lowerText.includes(s.name.toLowerCase()) || lowerText.includes(s.id.replace(/-/g, " ")));
-
-            if (dDate) session.pendingDate = dDate.toISOString().split("T")[0];
-            if (dTime) session.pendingTime = dTime;
-            if (dServ) session.pendingService = dServ;
-
-            // Build context for AI
-            const contextSummary = [
-                "User: " + pushName,
-                "Phone: " + sender,
-                "Current Date: " + new Date().toDateString(),
-                "Current Time: " + new Date().toLocaleTimeString(),
-                "Pending Date: " + (session.pendingDate || "none"),
-                "Pending Time: " + (session.pendingTime || "none"),
-                "Pending Service: " + (session.pendingService ? session.pendingService.name + " (" + session.pendingService.duration + " min)" : "none"),
-            ].join("\n");
-
-            const systemPrompt = "You are a friendly and professional business receptionist.\nYour role is to assist customers by:\n1. Clarifying our business services and what we offer\n2. Helping them set up appointments in our Google Calendar\n3. Checking calendar availability and proposing suitable time slots\n\n" + contextSummary;
-
-            try {
-                const result = await callOllamaWithSkills(systemPrompt, text, session.history, sender);
-                await sock.sendMessage(sender, { text: result.response });
-                session.history.push("Agent: " + result.response);
-
-                // Reset pending details if booking was created
-                if (result.bookingCreated) {
-                    session.pendingDate = null;
-                    session.pendingService = null;
-                    session.pendingTime = null;
-                }
-                saveSessions();
-            } catch (e) {
-                console.error("[AI] Error:", e);
-                await sock.sendMessage(sender, { text: "I am sorry, I am having trouble right now. Please try again in a moment." });
+        sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+            if (qr) {
+                console.log("\n=== SCAN QR IN WHATSAPP (Linked Devices) ===\n");
+                qrcode.generate(qr, { small: true });
+                console.log("\n===========================================\n");
             }
+            if (connection === 'open') {
+                console.log("? WhatsApp Connected!");
+            }
+            if (connection === 'close') {
+                const code = lastDisconnect?.error?.output?.statusCode;
+                const loggedOut = code === DisconnectReason.loggedOut;
+                console.log(`Connection closed (${code || "?"}). loggedOut: ${loggedOut}`);
+                if (loggedOut) { console.log("Logged out — exiting."); process.exit(1); }
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(connect, 3000);
+            }
+        });
 
-        }
-    });
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            for (const msg of messages) {
+                if (msg.key.fromMe) continue;
+                const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+                if (!text) continue;
+
+                const sender = msg.key.remoteJid;
+                const pushName = msg.pushName || 'unknown';
+                console.log(`[MSG] ${pushName}: ${text}`);
+
+                const session = getSession(sender);
+                const lowerText = text.toLowerCase();
+
+                session.history.push(`User: ${text}`);
+                if (session.history.length > 6) session.history = session.history.slice(-6);
+
+                const dDate = resolveDate(lowerText);
+                const dTime = extractTime(lowerText);
+                const dServ = SERVICES.find(s => lowerText.includes(s.name.toLowerCase()) || lowerText.includes(s.id.replace(/-/g, " ")));
+
+                if (dDate) session.pendingDate = dDate;
+                if (dTime) session.pendingTime = dTime;
+                if (dServ) session.pendingService = dServ;
+
+                const now = new Date();
+                const hh = now.getHours().toString().padStart(2, "0"), mmin = now.getMinutes().toString().padStart(2, "0");
+                const contextSummary = [
+                    "User: " + pushName,
+                    "Phone: " + sender,
+                    "Today: " + localDateStr(now),
+                    "Now: " + hh + ":" + mmin,
+                    "Pending Date: " + (session.pendingDate || "?"),
+                    "Pending Time: " + (session.pendingTime || "?"),
+                    "Pending Service: " + (session.pendingService ? session.pendingService.name + " (" + session.pendingService.duration + " min, id: " + session.pendingService.id + ")" : "?"),
+                ].join("\n");
+
+                const systemPrompt = "You are a friendly and professional business receptionist.\nYour role is to assist customers by:\n1. Clarifying our business services and what we offer\n2. Helping them set up appointments in our Google Calendar\n3. Checking calendar availability and proposing suitable time slots\n\n" + contextSummary;
+
+                try {
+                    const result = await callOllamaWithSkills(systemPrompt, text, session.history, sender);
+                    await sock.sendMessage(sender, { text: result.response });
+                    session.history.push("Agent: " + result.response);
+                    if (session.history.length > 6) session.history = session.history.slice(-6);
+
+                    if (result.bookingCreated) {
+                        session.pendingDate = null;
+                        session.pendingService = null;
+                        session.pendingTime = null;
+                    }
+                    saveSessions();
+                } catch (e) {
+                    console.error("[AI] Error:", e);
+                    await sock.sendMessage(sender, { text: "I am sorry, I am having trouble right now. Please try again in a moment." });
+                }
+            }
+        });
+    }
+
+    await connect();
 }
 
 main().catch(console.error);

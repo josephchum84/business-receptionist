@@ -129,13 +129,13 @@ The core agent. Connects to WhatsApp via Baileys, receives messages, passes them
 | `getSession(sender)` | 52-63 | Get or create session, reset on new day |
 | `resolveDate(text)` | 66-73 | Parse "today", "tomorrow", YYYY-MM-DD |
 | `extractTime(text)` | 76-89 | Parse HH:MM or "X am/pm" |
-| `stripThinking(text)` | 91-93 | Remove `<think>` tags (deepseek-r1) |
+| `stripThinking(text)` | 99-101 | Remove `<think>` tags (deepseek-r1) — applied only for final display, NOT in callOllama |
 | `getCalendarClient()` | 96-109 | Create OAuth2 client from env + token |
 | `createBooking(auth, eventData)` | 111-125 | Insert Google Calendar event |
 | `checkAvailability(auth, dateStr, startTimeStr, durationMins)` | 128-156 | Check if specific slot is free |
 | `findAvailableSlots(auth, dateStr, durationMins)` | 158-198 | Find free 30-min-increment slots |
-| `callOllama(prompt)` | 386-408 | HTTP POST to Ollama `/api/generate` |
-| `callOllamaWithSkills(systemPrompt, userMessage, history, senderPhone)` | 337-383 | Build prompt with skills, call Ollama, parse & execute skills, follow-up call |
+| `callOllama(prompt)` | 433-461 | HTTP POST to Ollama `/api/generate` — returns RAW response (includes `<think>` tags) |
+| `callOllamaWithSkills(systemPrompt, userMessage, history, senderPhone)` | 361-444 | Build prompt with skills, call Ollama, parse & execute skills, follow-up call |
 | `parseSkillCalls(text)` | 298-317 | Regex parse `[SKILL:name|param=value]` |
 | `executeSkills(calls)` | 319-335 | Execute parsed skill calls sequentially |
 | `main()` | 411-506 | Set up Baileys socket, event handlers |
@@ -222,14 +222,15 @@ Step 6: First AI Call → Ollama
 - HTTP POST to http://localhost:11434/api/generate
 - Model: deepseek-r1:8b
 - stream: false
-- Returns raw text (may contain <think> tags + [SKILL:...] tags)
-- stripThinking() removes <think>...</think> blocks
+- Returns RAW response (includes `<think>` tags + [SKILL:...] tags)
+- stripThinking() is NOT applied here — [SKILL:...] tags inside <think> blocks must be preserved
 
-Step 7: Parse Skill Calls
-──────────────────────────
+Step 7: Parse Skill Calls (from RAW response)
+──────────────────────────────────────────────
 - Regex: /\[SKILL:(\w+)(?:\|([^\]]+))?\]/g
-- Extract skill name and key=value parameter pairs
-- If no skill calls found → return AI response directly
+- Runs on raw AI response (with think tags intact) — finds skill calls even inside `<think>` blocks
+- If no skill calls found → strip thinking + return AI response directly
+- stripThinking() is applied only for the final display text sent to the user
 
 Step 8: Execute Skills (Sequential)
 ────────────────────────────────────
@@ -241,12 +242,14 @@ For each [SKILL:xxx] tag:
 
 Each skill returns text (or JSON for create_booking).
 
-Step 9: Second AI Call (Follow-up)
-───────────────────────────────────
-- Original prompt + skill results appended
-- AI asked to provide natural conversational response
-- AI told NOT to include more skill calls
-- Only confirm booking if create_booking returned success:true
+Step 9: Response Formatting
+────────────────────────────
+- If create_booking succeeded → response is formatted DIRECTLY in JavaScript (bypasses follow-up AI)
+  Includes: service name, date, time, and Google Calendar htmlLink
+- If no booking or booking failed → follow-up AI call with skill results
+  Prompt tells AI the result and asks for natural response
+- stripThinking() applied to final display text
+- [SKILL:...] tags stripped from final output
 
 Step 10: Send Reply
 ────────────────────
@@ -685,17 +688,24 @@ The scheduling system follows a **fail-closed** principle to prevent false-posit
 
 ### 13.2 AI Prompt Rules
 
-The system prompt injected into every AI call includes these hard rules:
+The prompt constructed in `callOllamaWithSkills` injects these mandatory rules:
 
-1. "You MUST call check_availability or find_available_slots BEFORE every booking proposal. NEVER assume a slot is free."
-2. "If check_availability returns UNAVAILABLE or an ERROR, you MUST NOT confirm the booking. Offer alternatives instead."
-3. "ONLY use create_booking when the user has EXPLICITLY confirmed AND availability has been verified."
-4. "NEVER tell the user a booking is confirmed unless create_booking returned success: true."
+RULES:
+- FIRST message asking to book → output ONLY [SKILL:check_availability|...] (no other text)
+- [SKILL:...] runs silently and is hidden from user
+- When user says yes/confirm after check → output [SKILL:create_booking|...] with all params from context (do NOT check availability again)
+- After create_booking, tell user the result
+- Keep replies to 1-2 sentences
 
-The follow-up prompt additionally enforces:
-- "Only confirm a booking if create_booking returned success: true."
-- "If availability check returned UNAVAILABLE or ERROR, do NOT tell the user the slot is booked."
-- "If a booking was NOT created, do NOT say it was confirmed."
+The prompt also includes dynamic examples with the actual today/tomorrow dates and the user's name from context.
+
+Success path (no follow-up AI):
+- When `create_booking` returns `success: true`, the response is formatted directly in JavaScript code (bypasses the follow-up AI call) and includes the Google Calendar `htmlLink`.
+
+Failure path (follow-up AI):
+- If no skill calls are generated → AI's raw text is stripped of `<think>` tags and returned directly
+- If availability was checked → follow-up AI receives the result and generates a natural response
+- If `create_booking` failed → follow-up AI receives the error and generates a helpful message
 
 ---
 
@@ -713,7 +723,10 @@ The follow-up prompt additionally enforces:
 | Port 3000 in use | Another process on that port | Change PORT in .env or kill conflicting process |
 | `npm start` fails | PowerShell script error | Use `cmd /c npm start` instead |
 | Monitor shows "not initialized" | No WhatsApp auth yet | Start `whatsapp_agent.js` and scan QR |
-| Skills not being called | Model response doesn't include `[SKILL:...]` tags | Check Ollama model is `deepseek-r1:8b` (other models may not follow format) |
+| Skills not being called | Model response doesn't include `[SKILL:...]` tags | Check Ollama model is `deepseek-r1:8b`. If prompt says "Never mention skill calls", the model may avoid using them. The current prompt uses "runs silently and is hidden" instead. |
+| AI says "booked/confirmed" without checking | Skill calls lost inside `<think>` tags | Fixed by returning raw response from `callOllama()` — `[SKILL:...]` inside think blocks is now preserved for `parseSkillCalls()` |
+| Date off by one day (e.g., shows May 18 for tomorrow) | `resolveDate()` used `.toISOString()` which converts to UTC | Fixed by using `localDateStr()` helper that uses local time getters |
+| Booking link not in response | Follow-up AI ignored `htmlLink` from skill result | Fixed by formatting booking confirmation directly in JavaScript with the link |
 
 ### 14.2 Log Files
 

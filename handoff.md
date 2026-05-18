@@ -1,6 +1,36 @@
 ﻿# Handoff Document: Business Receptionist AI Agent
 
-## 0. Recent Fix: False-Positive Booking Confirmations (2026-05-16)
+## 0c. Fix: Skill Calls Lost in Think Tags, Date Bug, Booking Link Not Sent (2026-05-18)
+
+**Problem 1 - Skill calls destroyed by stripThinking:** `callOllama()` applied `stripThinking()` to the raw AI response BEFORE `parseSkillCalls()` could find `[SKILL:...]` tags. Deepseek-r1 generates its reasoning inside `<think>` blocks, including skill call syntax. These were silently deleted, causing the AI to receive no skill result and fabricate responses (e.g., claiming slots were "already booked by another client" without ever querying Google Calendar).
+
+**Fix:** Removed `stripThinking()` from `callOllama()`. The function now returns the raw response with think tags intact. `parseSkillCalls()` runs on raw text and finds skill calls even inside think blocks. `stripThinking()` is only applied for the final display text sent to the user.
+
+**Problem 2 - Date off by one due to UTC conversion:** `resolveDate("tomorrow")` created `new Date(2026, 4, 19)` (midnight local May 19), but `.toISOString().split("T")[0]` converted to UTC → `"2026-05-18"` (one day earlier). This caused the context summary to show the wrong pending date, confusing the AI.
+
+**Fix:** Added `localDateStr(date)` helper that formats dates using local time methods (`getFullYear`, `getMonth`, `getDate`) instead of `.toISOString()`. `resolveDate()` now returns a string directly. Context summary uses `localDateStr()` throughout.
+
+**Problem 3 - AI didn't generate [SKILL:...] calls at all:** The prompt rule "Never mention skill calls to user" contradicted the instruction to output `[SKILL:...]` syntax. Deepseek-r1 interpreted this as "don't use skill calls" and generated natural language responses without any function calls. `[TRACE] skillCalls found: 0 []` confirmed zero skill calls were generated.
+
+**Fix:** Rewrote the prompt section:
+- Removed "Never mention skill calls to user" — replaced with "The [SKILL:...] will be executed automatically and hidden from the user"
+- Added "ALWAYS output [SKILL:check_availability|...] with the correct date/time/duration before saying anything else"
+- Dynamic example dates using actual today/tomorrow instead of hardcoded values
+- Added "When user says yes/confirm after check → output [SKILL:create_booking|...] with all params from context"
+- Context summary now includes `service_id` (e.g., "Initial Business Meeting (60 min, id: initial-meeting)")
+
+**Problem 4 - Booking confirmation link not sent to user:** The `htmlLink` from Google Calendar API was returned in the skill result JSON but the follow-up AI never included it in its natural language response. Users were told "I've booked it" without receiving the calendar link.
+
+**Fix:** When `create_booking` succeeds, the response is formatted directly in JavaScript (bypassing the follow-up AI) and includes the Google Calendar link. The user now receives: "Your Initial Business Meeting has been booked for 2026-05-19 at 15:00.\n\nGoogle Calendar link: https://www.google.com/calendar/event?eid=..."
+
+**Files Modified:**
+- `whatsapp_agent.js` — All 4 fixes above
+
+---
+
+## 0b. Previous Fix: Looping Issue and AI+Skills Architecture (2026-05-15)
+
+**Problem Identified:** The original message handler in whatsapp_agent.js used a hard-coded state machine (idle -> confirming -> confirmed) that caused multiple looping issues:
 
 **Problem Identified:** The agent was providing false-positive scheduling confirmations - telling users a time slot was available and confirming bookings without actually verifying against Google Calendar. Root causes:
 
