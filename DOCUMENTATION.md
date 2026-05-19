@@ -23,12 +23,10 @@
 
 The **Business Receptionist** is a 24/7 WhatsApp-integrated AI receptionist that schedules appointments via Google Calendar. It uses a **skills-based conversation architecture** where an LLM (Ollama running `deepseek-r1:8b`) dynamically decides which tools to invoke during a conversation, rather than relying on a hard-coded state machine.
 
-**Core capabilities:**
-- Respond to customer inquiries on WhatsApp 24/7
-- List business services with durations and pricing
-- Check Google Calendar availability for specific dates/times
-- Find all available time slots on a given date
-- Create calendar bookings after explicit user confirmation
+**Core capabilities (scoped to 2 areas only):**
+- **Business Enquiries** — List business services with durations and pricing
+- **Booking Appointments** — Check availability, find slots, create calendar bookings
+- Kindly decline any out-of-scope queries and guide users back to the 2 supported areas
 - Persist conversation sessions with daily reset
 
 ---
@@ -117,7 +115,7 @@ They share `data/sessions.json` and `token.json` but run independently.
 
 ## 3. System Components
 
-### 3.1 `whatsapp_agent.js` (Primary Agent — 508 lines)
+### 3.1 `whatsapp_agent.js` (Primary Agent — 610 lines)
 
 The core agent. Connects to WhatsApp via Baileys, receives messages, passes them through Ollama with a skills-based prompt, executes skill calls against Google Calendar, and replies on WhatsApp.
 
@@ -353,14 +351,14 @@ If error → { success: false, message }
 
 ## 5. Skills System
 
-### 5.1 Available Skills
+### 5.1 Available Skills (2 Categories)
 
-| Skill | Params | Description |
-|-------|--------|-------------|
-| `list_services` | *(none)* | List all 5 business services with name, duration, price, description |
-| `check_availability` | `date`, `time`, `duration` | Check if a specific date/time slot is free |
-| `find_available_slots` | `date`, `duration` | Find all free slots on a date for the given duration |
-| `create_booking` | `date`, `time`, `service_id`, `name`, `phone` | Create a calendar booking after user confirmation |
+| Category | Skill | Params | Description |
+|----------|-------|--------|-------------|
+| Business Enquiries | `list_services` | *(none)* | List all 5 business services with name, duration, price, description |
+| Booking Appointments | `check_availability` | `date`, `time`, `duration` | Check if a specific date/time slot is free |
+| Booking Appointments | `find_available_slots` | `date`, `duration` | Find all free slots on a date for the given duration |
+| Booking Appointments | `create_booking` | `date`, `time`, `service_id`, `name`, `phone` | Create a calendar booking after user confirmation |
 
 ### 5.2 Skill Invocation Format
 
@@ -678,6 +676,7 @@ The scheduling system follows a **fail-closed** principle to prevent false-posit
 
 | Condition | Behavior |
 |-----------|----------|
+| User asks something outside business/booking scope | AI politely declines and guides back to the 2 supported areas |
 | Google Calendar API unreachable | `checkAvailability()` returns `{available: false, error}` |
 | Calendar API error in check | `check_availability` skill returns "ERROR: Could not verify availability..." |
 | Calendar API error during booking | `create_booking` rejects the booking — never proceeds |
@@ -691,11 +690,12 @@ The scheduling system follows a **fail-closed** principle to prevent false-posit
 The prompt constructed in `callOllamaWithSkills` injects these mandatory rules:
 
 RULES:
+- You can ONLY help with business enquiries or booking appointments. For anything else, kindly decline and guide back to the 2 supported areas.
 - FIRST message asking to book → output ONLY [SKILL:check_availability|...] (no other text)
 - [SKILL:...] runs silently and is hidden from user
 - When user says yes/confirm after check → output [SKILL:create_booking|...] with all params from context (do NOT check availability again)
 - After create_booking, tell user the result
-- Keep replies to 1-2 sentences
+- Keep replies to 1 sentence. Be direct and fast.
 
 The prompt also includes dynamic examples with the actual today/tomorrow dates and the user's name from context.
 
@@ -754,7 +754,7 @@ See `e2e_test_log.md` for detailed end-to-end testing results of the Langfuse ob
 
 | File | Lines | Type | Role |
 |------|-------|------|------|
-| `whatsapp_agent.js` | 508 | Node.js | Primary WhatsApp+AI+Calendar agent |
+| `whatsapp_agent.js` | 610 | Node.js | Primary WhatsApp+AI+Calendar agent |
 | `server/index.js` | 468 | Node.js | Express REST API + monitor |
 | `whatsapp_bridge/bridge.mjs` | 99 | Node.js | Standalone WhatsApp bridge (stdin/stdout) |
 | `exchange_token.js` | 62 | Node.js | Google OAuth token exchange utility |

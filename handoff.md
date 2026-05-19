@@ -1,5 +1,26 @@
 ﻿# Handoff Document: Business Receptionist AI Agent
 
+## 0d. Scope Agent to 2 Skills: Business Enquiries & Booking Appointments (2026-05-19)
+
+**Problem:** The agent accepted any type of query without restriction, wasting AI inference on out-of-scope conversations. The 600s Ollama timeout and large context histories (4 messages passed to model, 6 kept in session) made responses slow.
+
+**Changes:**
+
+1. **Scoped system prompt** — Agent now specializes in ONLY 2 areas: Business Enquiries (services info, pricing) and Booking Appointments (availability check, scheduling). For anything else, the AI kindly declines and guides back.
+
+2. **Skills grouped under 2 categories in prompt** — `list_services` under "BUSINESS ENQUIRIES"; `check_availability`, `find_available_slots`, `create_booking` under "BOOKING APPOINTMENTS". Clear separation helps the model choose correctly.
+
+3. **Rejection rule added** — "You can ONLY help with business enquiries or booking appointments. For anything else, kindly say: 'I'm sorry, I can only assist with business enquiries and booking appointments. Would you like to know about our services or schedule a meeting?'"
+
+4. **Ollama timeout reduced** — 600000ms (10 min) → 120000ms (2 min). Faster failure recovery prevents users from waiting minutes for a timeout error.
+
+5. **Reduced context size** — History passed to model: 4 → 2 messages. Session trim threshold: 6 → 4. Less prompt context means faster inference.
+
+**Files Modified:**
+- `whatsapp_agent.js` — Lines 362-375 (skill categorization), 387-393 (rules), 585 (system prompt), 476 (timeout), 563/591 (history trim)
+
+---
+
 ## 0c. Fix: Skill Calls Lost in Think Tags, Date Bug, Booking Link Not Sent (2026-05-18)
 
 **Problem 1 - Skill calls destroyed by stripThinking:** `callOllama()` applied `stripThinking()` to the raw AI response BEFORE `parseSkillCalls()` could find `[SKILL:...]` tags. Deepseek-r1 generates its reasoning inside `<think>` blocks, including skill call syntax. These were silently deleted, causing the AI to receive no skill result and fabricate responses (e.g., claiming slots were "already booked by another client" without ever querying Google Calendar).
@@ -175,7 +196,7 @@ No re-authorization of the Google OAuth token is needed.
 | `sessions/baileys_auth/` | WhatsApp auth state (checked by /api/monitor/whatsapp-status) |
 | `token.json` | Google Calendar OAuth token (checked by /api/monitor/calendar-status) |
 | `.env` | Environment config (OLLAMA_HOST, GOOGLE_TOKEN_FILE, API_KEY, etc.) |
-| `whatsapp_agent.js` | Main WhatsApp agent (Baileys + Ollama + Calendar integration) |
+| `whatsapp_agent.js` | Main WhatsApp agent (Baileys + Ollama + Calendar integration, scoped to 2 skills) |
 
 ### Assets
 

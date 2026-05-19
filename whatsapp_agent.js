@@ -359,28 +359,39 @@ async function executeSkills(calls) {
 }
 
 async function callOllamaWithSkills(systemPrompt, userMessage, history, senderPhone) {
-    const skillDescriptions = Object.entries(SKILLS).map(function(entry) {
-        const name = entry[0], skill = entry[1];
-        const params = skill.params.length > 0 ? " (params: " + skill.params.join(", ") + ")" : "";
-        return "- " + name + params + ": " + skill.description;
-    }).join("\n");
+    const cat1Skills = ["list_services"];
+    const cat2Skills = ["check_availability", "find_available_slots", "create_booking"];
+    const skillDescriptions = "1. BUSINESS ENQUIRIES:\n" +
+        Object.entries(SKILLS).filter(e => cat1Skills.includes(e[0])).map(function(entry) {
+            const name = entry[0], skill = entry[1];
+            const params = skill.params.length > 0 ? " (params: " + skill.params.join(", ") + ")" : "";
+            return "  - " + name + params + ": " + skill.description;
+        }).join("\n") +
+        "\n2. BOOKING APPOINTMENTS:\n" +
+        Object.entries(SKILLS).filter(e => cat2Skills.includes(e[0])).map(function(entry) {
+            const name = entry[0], skill = entry[1];
+            const params = skill.params.length > 0 ? " (params: " + skill.params.join(", ") + ")" : "";
+            return "  - " + name + params + ": " + skill.description;
+        }).join("\n");
 
     const todayStr = localDateStr(new Date());
     const tomorrowStr = localDateStr(new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1));
     // Extract user name from systemPrompt (format: "User: NAME")
     const userName = (systemPrompt.match(/User:\s*(\S+)/) || [,""])[1];
-    const fullPrompt = systemPrompt + "\n\nAVAILABLE ACTIONS:\n" + skillDescriptions + "\n\n" +
-"Use [SKILL:name|param=value|...] in your response to call an action. Example:\n" +
-"  Check: [SKILL:check_availability|date=" + todayStr + "|time=10:00|duration=60]\n" +
-"  Book:  [SKILL:create_booking|date=" + todayStr + "|time=10:00|service_id=consultation|name=" + userName + "|phone=" + senderPhone + "]\n" +
-"  Slots: [SKILL:find_available_slots|date=" + tomorrowStr + "|duration=60]\n\n" +
+    const fullPrompt = systemPrompt + "\n\nYOUR CAPABILITIES (use these actions via [SKILL:] tags):\n" + skillDescriptions + "\n\n" +
+"Usage examples:\n" +
+"  [SKILL:list_services]\n" +
+"  [SKILL:check_availability|date=" + todayStr + "|time=10:00|duration=60]\n" +
+"  [SKILL:find_available_slots|date=" + tomorrowStr + "|duration=60]\n" +
+"  [SKILL:create_booking|date=" + todayStr + "|time=10:00|service_id=consultation|name=" + userName + "|phone=" + senderPhone + "]\n\n" +
 "RULES:\n" +
+"- You can ONLY help with business enquiries or booking appointments. For anything else, kindly say: \"I'm sorry, I can only assist with business enquiries and booking appointments. Would you like to know about our services or schedule a meeting?\"\n" +
 "- FIRST message asking to book → output ONLY [SKILL:check_availability|...] (no other text)\n" +
 "- [SKILL:...] runs silently and is hidden from user\n" +
 "- When user says yes/confirm after check → output [SKILL:create_booking|...] with all params from context (do NOT check availability again)\n" +
 "- After create_booking, tell user the result\n" +
-"- Keep replies to 1-2 sentences\n\n" +
-"History:\n" + history.slice(-4).join("\n") + "\n\nUser: " + userMessage;
+"- Keep replies to 1 sentence. Be direct and fast.\n\n" +
+"History:\n" + history.slice(-2).join("\n") + "\n\nUser: " + userMessage;
 
     let aiRes;
     try {
@@ -462,7 +473,7 @@ async function callOllamaWithSkills(systemPrompt, userMessage, history, senderPh
 }
 
 // 4. AI INTEGRATION
-const OLLAMA_TIMEOUT = 600000;
+const OLLAMA_TIMEOUT = 120000;
 
 async function callOllama(prompt) {
     const host = envs.OLLAMA_HOST || "http://localhost:11434";
@@ -549,7 +560,7 @@ async function main() {
                 const lowerText = text.toLowerCase();
 
                 session.history.push(`User: ${text}`);
-                if (session.history.length > 6) session.history = session.history.slice(-6);
+                if (session.history.length > 4) session.history = session.history.slice(-4);
 
                 const dDate = resolveDate(lowerText);
                 const dTime = extractTime(lowerText);
@@ -571,13 +582,13 @@ async function main() {
                     "Pending Service: " + (session.pendingService ? session.pendingService.name + " (" + session.pendingService.duration + " min, id: " + session.pendingService.id + ")" : "?"),
                 ].join("\n");
 
-                const systemPrompt = "You are a friendly and professional business receptionist.\nYour role is to assist customers by:\n1. Clarifying our business services and what we offer\n2. Helping them set up appointments in our Google Calendar\n3. Checking calendar availability and proposing suitable time slots\n\n" + contextSummary;
+                const systemPrompt = "You are a friendly and professional business receptionist specializing in ONLY 2 areas:\n1. BUSINESS ENQUIRIES - Tell customers about our services, pricing, and offerings\n2. BOOKING APPOINTMENTS - Check availability and schedule appointments\n\nIf a customer asks about anything outside these 2 areas, politely decline and guide them back. Keep responses short and direct.\n\n" + contextSummary;
 
                 try {
                     const result = await callOllamaWithSkills(systemPrompt, text, session.history, sender);
                     await sock.sendMessage(sender, { text: result.response });
                     session.history.push("Agent: " + result.response);
-                    if (session.history.length > 6) session.history = session.history.slice(-6);
+                    if (session.history.length > 4) session.history = session.history.slice(-4);
 
                     if (result.bookingCreated) {
                         session.pendingDate = null;
