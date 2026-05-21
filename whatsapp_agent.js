@@ -477,7 +477,7 @@ const OLLAMA_TIMEOUT = 120000;
 
 async function callOllama(prompt) {
     const host = envs.OLLAMA_HOST || "http://localhost:11434";
-    const model = "deepseek-r1:8b";
+    const model = envs.OLLAMA_MODEL || "gemma4:31b-cloud";
     return new Promise((resolve, reject) => {
         const url = new URL(host);
         const req = http.request({
